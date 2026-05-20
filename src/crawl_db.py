@@ -16,8 +16,16 @@ DB_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 @contextmanager
 def get_db():
     """Context manager for database connections"""
-    conn = sqlite3.connect(DB_FILE)
+    # timeout: wait up to 60s for a lock instead of failing fast (default 5s).
+    conn = sqlite3.connect(DB_FILE, timeout=60)
     conn.row_factory = sqlite3.Row  # Return rows as dictionaries
+    # WAL mode lets readers and writers work concurrently instead of failing
+    # with "database is locked". It is a persistent property of the database
+    # file, so it also applies to the auth connections opened elsewhere.
+    # busy_timeout makes a connection wait for a lock rather than erroring.
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA busy_timeout=60000')
+    conn.execute('PRAGMA synchronous=NORMAL')
     try:
         yield conn
         conn.commit()
