@@ -363,94 +363,130 @@ class IssueDetector:
                     'details': f'Image returned {status}: {img_url}'
                 })
 
-    def detect_duplication_issues(self, all_results, similarity_threshold=0.85):
+    def detect_duplication_issues(self, all_results, similarity_threshold=0.85,
+                                  exact_limit=1000, window=20):
         """
         Detect content duplication across all crawled pages.
+
+        For small crawls every page pair is compared directly. An exhaustive
+        comparison is O(n^2) - for tens of thousands of pages that is hundreds
+        of millions of comparisons (days of work) and the list of seen pairs
+        alone would exhaust memory. So for large crawls candidate pairs are
+        generated with the Sorted Neighborhood Method: pages are sorted by a
+        normalised title key and again by a normalised description key, and
+        only pages within a small sliding window of each other are compared.
+        A pair can only reach the default 0.85 threshold when both its titles
+        and its descriptions are highly similar (title and description each
+        carry 0.35 of the score), so this catches real duplicates while
+        keeping the work roughly linear in the number of pages.
 
         Args:
             all_results: List of all crawled result dictionaries
             similarity_threshold: Minimum similarity ratio to flag as duplicate (0.0-1.0)
+            exact_limit: Crawls with at most this many pages use an exhaustive
+                comparison; larger crawls use blocking.
+            window: Sliding window size for the Sorted Neighborhood Method.
         """
-        issues = []
-        processed_pairs = set()
-
-        # Compare each result with all others
-        for i, result1 in enumerate(all_results):
-            url1 = result1.get('url', '')
-
-            # Skip if URL should be excluded
-            if self._should_exclude(url1):
+        # Build a normalised signature for every page once, so the expensive
+        # string normalisation is not repeated for every comparison.
+        pages = []
+        for result in all_results:
+            url = result.get('url', '')
+            if self._should_exclude(url):
                 continue
+            pages.append({
+                'url': url,
+                'title': (result.get('title') or '').lower().strip(),
+                'desc': (result.get('meta_description') or '').lower().strip(),
+                'h1': (result.get('h1') or '').lower().strip(),
+                'word_count': result.get('word_count', 0) or 0,
+            })
 
-            for j, result2 in enumerate(all_results):
-                # Skip same URL or already processed pairs
-                if i >= j:
-                    continue
+        n = len(pages)
+        if n < 2:
+            return
 
-                url2 = result2.get('url', '')
+        if n <= exact_limit:
+            candidate_pairs = (
+                (i, j) for i in range(n) for j in range(i + 1, n)
+            )
+        else:
+            candidate_pairs = self._duplication_candidate_pairs(pages, window)
 
-                # Skip if URL should be excluded
-                if self._should_exclude(url2):
-                    continue
-
-                # Create unique pair identifier
-                pair_key = tuple(sorted([url1, url2]))
-                if pair_key in processed_pairs:
-                    continue
-
-                processed_pairs.add(pair_key)
-
-                # Calculate similarity
-                similarity = self._calculate_content_similarity(result1, result2)
-
-                # Flag as duplicate if above threshold
-                if similarity >= similarity_threshold:
-                    # Add issue for both URLs
-                    issues.append({
-                        'url': url1,
-                        'type': 'warning',
-                        'category': 'Duplication',
-                        'issue': 'Duplicate Content Detected',
-                        'details': f'Content is {similarity*100:.1f}% similar to {url2}'
-                    })
-                    issues.append({
-                        'url': url2,
-                        'type': 'warning',
-                        'category': 'Duplication',
-                        'issue': 'Duplicate Content Detected',
-                        'details': f'Content is {similarity*100:.1f}% similar to {url1}'
-                    })
+        issues = []
+        for i, j in candidate_pairs:
+            similarity = self._calculate_signature_similarity(pages[i], pages[j])
+            if similarity >= similarity_threshold:
+                page_i, page_j = pages[i], pages[j]
+                issues.append({
+                    'url': page_i['url'],
+                    'type': 'warning',
+                    'category': 'Duplication',
+                    'issue': 'Duplicate Content Detected',
+                    'details': f"Content is {similarity*100:.1f}% similar to {page_j['url']}"
+                })
+                issues.append({
+                    'url': page_j['url'],
+                    'type': 'warning',
+                    'category': 'Duplication',
+                    'issue': 'Duplicate Content Detected',
+                    'details': f"Content is {similarity*100:.1f}% similar to {page_i['url']}"
+                })
 
         # Add all detected duplication issues
         with self.issues_lock:
             self.detected_issues.extend(issues)
 
-    def _calculate_content_similarity(self, result1, result2):
+    def _duplication_candidate_pairs(self, pages, window):
         """
-        Calculate similarity between two page results.
+        Generate candidate duplicate pairs for a large crawl using the Sorted
+        Neighborhood Method. Pages are sorted by a normalised title key and by
+        a normalised description key; within each ordering, every page is
+        paired with the next `window` pages. Returns a set of (i, j) index
+        pairs with i < j.
+        """
+        n = len(pages)
+        candidates = set()
+        for field in ('title', 'desc'):
+            order = sorted(
+                range(n),
+                key=lambda idx: self._blocking_key(pages[idx][field])
+            )
+            for a in range(n):
+                for b in range(a + 1, min(a + 1 + window, n)):
+                    i, j = order[a], order[b]
+                    if i == j:
+                        continue
+                    candidates.add((i, j) if i < j else (j, i))
+        return candidates
 
-        Compares title, meta description, h1, and content length.
+    @staticmethod
+    def _blocking_key(text):
+        """
+        Build a blocking key that is stable under word reordering, so pages
+        whose title/description differ only in word order still sort next to
+        each other.
+        """
+        return ' '.join(sorted(text.split()))
+
+    def _calculate_signature_similarity(self, sig1, sig2):
+        """
+        Calculate similarity between two pre-normalised page signatures.
+
+        Compares title, meta description, h1, and content length using a
+        weighted average; title and description are the most important.
         Returns a similarity ratio between 0.0 and 1.0.
         """
-        # Extract content fields
-        title1 = result1.get('title', '').lower().strip()
-        title2 = result2.get('title', '').lower().strip()
+        title1, title2 = sig1['title'], sig2['title']
+        desc1, desc2 = sig1['desc'], sig2['desc']
+        h1_1, h1_2 = sig1['h1'], sig2['h1']
 
-        desc1 = result1.get('meta_description', '').lower().strip()
-        desc2 = result2.get('meta_description', '').lower().strip()
-
-        h1_1 = result1.get('h1', '').lower().strip()
-        h1_2 = result2.get('h1', '').lower().strip()
-
-        word_count1 = result1.get('word_count', 0)
-        word_count2 = result2.get('word_count', 0)
-
-        # Calculate individual similarities
         title_sim = self._text_similarity(title1, title2) if title1 and title2 else 0
         desc_sim = self._text_similarity(desc1, desc2) if desc1 and desc2 else 0
         h1_sim = self._text_similarity(h1_1, h1_2) if h1_1 and h1_2 else 0
 
-        # Word count similarity (1.0 if within 10% of each other)
+        # Word count similarity (1.0 when the two counts are equal)
+        word_count1, word_count2 = sig1['word_count'], sig2['word_count']
         if word_count1 and word_count2:
             max_count = max(word_count1, word_count2)
             min_count = min(word_count1, word_count2)
@@ -459,21 +495,12 @@ class IssueDetector:
             word_count_sim = 0
 
         # Weighted average (title and description are most important)
-        weights = {
-            'title': 0.35,
-            'desc': 0.35,
-            'h1': 0.20,
-            'word_count': 0.10
-        }
-
-        overall_similarity = (
-            title_sim * weights['title'] +
-            desc_sim * weights['desc'] +
-            h1_sim * weights['h1'] +
-            word_count_sim * weights['word_count']
+        return (
+            title_sim * 0.35 +
+            desc_sim * 0.35 +
+            h1_sim * 0.20 +
+            word_count_sim * 0.10
         )
-
-        return overall_similarity
 
     def _text_similarity(self, text1, text2):
         """Calculate similarity ratio between two text strings using SequenceMatcher"""
