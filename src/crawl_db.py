@@ -198,18 +198,28 @@ def init_crawl_tables():
 
         print("Crawl persistence tables initialized successfully")
 
+# Config keys that must never be persisted into config_snapshot (secrets).
+SECRET_CONFIG_KEYS = {'google_api_key', 'proxy_url', 'custom_headers'}
+
 def create_crawl(user_id, session_id, base_url, base_domain, config_snapshot):
     """
     Create a new crawl record
     Returns the crawl_id
     """
     try:
+        # Strip secrets before persisting — config_snapshot is read back verbatim
+        # on resume and would otherwise store API keys in plaintext.
+        safe_snapshot = config_snapshot
+        if isinstance(config_snapshot, dict):
+            safe_snapshot = {k: v for k, v in config_snapshot.items()
+                             if k not in SECRET_CONFIG_KEYS}
+
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 INSERT INTO crawls (user_id, session_id, base_url, base_domain, config_snapshot, status)
                 VALUES (?, ?, ?, ?, ?, 'running')
-            ''', (user_id, session_id, base_url, base_domain, json.dumps(config_snapshot)))
+            ''', (user_id, session_id, base_url, base_domain, json.dumps(safe_snapshot)))
 
             crawl_id = cursor.lastrowid
             print(f"Created new crawl record: ID={crawl_id}, URL={base_url}")
@@ -554,6 +564,18 @@ def load_crawl_links(crawl_id, limit=None, offset=0):
     except Exception as e:
         print(f"Error loading links: {e}")
         return []
+
+def count_crawl_links(crawl_id):
+    """Return the total number of links stored for a crawl"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM crawl_links WHERE crawl_id = ?', (crawl_id,))
+            row = cursor.fetchone()
+            return row[0] if row else 0
+    except Exception as e:
+        print(f"Error counting links: {e}")
+        return 0
 
 def load_crawl_issues(crawl_id, limit=None, offset=0):
     """Load all issues for a crawl"""
