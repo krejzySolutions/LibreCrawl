@@ -97,6 +97,9 @@ async function loadCrawlFromDashboard(crawlId) {
         // Close dashboard
         closeDashboard();
 
+        // Track which historical crawl is being viewed
+        crawlState.viewingCrawlId = crawlId;
+
         // Clear UI and reset state
         clearAllTables();
         resetStats();
@@ -235,6 +238,22 @@ async function deleteCrawlFromDashboard(crawlId) {
 
         if (data.success) {
             showNotification('Crawl deleted', 'success');
+
+            // If the deleted crawl was the one currently being viewed, clear
+            // the UI — its rows must not linger in the windowed scrollers.
+            if (crawlState.viewingCrawlId === crawlId) {
+                crawlState.viewingCrawlId = null;
+                crawlState.urls = [];
+                crawlState.links = [];
+                crawlState.issues = [];
+                switchScrollersToOwned();
+                clearAllTables();
+                resetStats();
+                updateStatsDisplay();
+                updateFilterCounts();
+                updateStatus('Crawl deleted');
+            }
+
             // Reload dashboard
             openDashboard();
         } else {

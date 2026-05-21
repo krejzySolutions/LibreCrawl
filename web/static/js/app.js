@@ -4,6 +4,7 @@ let crawlState = {
     isPaused: false,
     startTime: null,
     baseUrl: null,
+    viewingCrawlId: null,
     urls: [],
     links: [],
     issues: [],
@@ -71,6 +72,7 @@ async function initializeApp() {
             crawlState.urls = [];
             crawlState.links = [];
             crawlState.issues = [];
+            crawlState.viewingCrawlId = data.viewing_crawl_id;
             crawlState.baseUrl = data.stats?.baseUrl || '';
             crawlState.stats = {
                 discovered: data.urls_count || 0,
@@ -729,6 +731,49 @@ function initializeVirtualScrollers() {
 // Tracks totals for windowed mode; null means live/owned mode is active.
 let _windowedTotals = null; // null = owned; {urls, links, issues} = windowed
 let _windowedUrlStats = null; // SQL-computed filter-sidebar breakdown for the viewed crawl
+let _windowedSearchQuery = ''; // current URL substring search query in windowed mode
+let _windowedFilter = ''; // current sidebar category filter in windowed mode
+let _urlSearchTimer = null; // debounce timer for searchUrls()
+
+/**
+ * Build a /api/crawl_data URL carrying the active windowed search + filter.
+ */
+function buildCrawlDataUrl(kind, offset, limit) {
+    let url = `/api/crawl_data?kind=${kind}&offset=${offset}&limit=${limit}`;
+    if (kind === 'urls') {
+        if (_windowedSearchQuery) url += `&q=${encodeURIComponent(_windowedSearchQuery)}`;
+        if (_windowedFilter) url += `&filter=${encodeURIComponent(_windowedFilter)}`;
+    }
+    return url;
+}
+
+/**
+ * Re-point the URL scrollers (overview/internal/external) at the server with
+ * the current windowed search query + category filter applied, and refresh
+ * their total row counts. Used by both searchUrls() and toggleFilter().
+ */
+async function applyWindowedUrlQuery() {
+    let total;
+    try {
+        const resp = await fetch(buildCrawlDataUrl('urls', 0, 1));
+        total = (await resp.json()).total || 0;
+    } catch (e) {
+        console.error('applyWindowedUrlQuery probe failed:', e);
+        return;
+    }
+    const fetchFn = function(offset, limit) {
+        return fetch(buildCrawlDataUrl('urls', offset, limit))
+            .then(r => r.json())
+            .then(d => d.rows || []);
+    };
+    ['overview', 'internal', 'external'].forEach(function(key) {
+        const scroller = virtualScrollers[key];
+        if (!scroller) return;
+        scroller.setFetchPage(fetchFn);
+        scroller.reset();
+        scroller.setTotalCount(total);
+    });
+}
 
 /**
  * Rebuild the virtual scrollers in windowed mode for a historical crawl.
@@ -748,10 +793,12 @@ let _windowedUrlStats = null; // SQL-computed filter-sidebar breakdown for the v
 function switchScrollersToWindowed(counts) {
     _windowedTotals = counts;
     _windowedUrlStats = counts.url_stats || null;
+    _windowedSearchQuery = '';
+    _windowedFilter = '';
 
     function makeFetchFn(kind) {
         return function(offset, limit) {
-            return fetch(`/api/crawl_data?kind=${kind}&offset=${offset}&limit=${limit}`)
+            return fetch(buildCrawlDataUrl(kind, offset, limit))
                 .then(r => r.json())
                 .then(data => data.rows || []);
         };
@@ -1209,14 +1256,27 @@ function filterIssues(filterType) {
 
 // Filter Management
 function toggleFilter(filterType) {
+    // Clicking the active filter again clears it
+    if (crawlState.filters.active === filterType) {
+        clearActiveFilters();
+        return;
+    }
+
     const filterItems = document.querySelectorAll('.filter-item');
     filterItems.forEach(item => item.classList.remove('active'));
-
-    event.currentTarget.classList.add('active');
+    if (typeof event !== 'undefined' && event && event.currentTarget) {
+        event.currentTarget.classList.add('active');
+    }
     crawlState.filters.active = filterType;
 
-    // Apply filter to tables
-    applyFilter(filterType);
+    if (_windowedTotals !== null) {
+        // Windowed mode (historical crawl): filter server-side
+        _windowedFilter = filterType;
+        applyWindowedUrlQuery();
+    } else {
+        // Owned mode (live crawl): filter the in-memory arrays
+        applyFilter(filterType);
+    }
 }
 
 function applyFilter(filterType) {
@@ -1236,8 +1296,16 @@ function applyFilter(filterType) {
 
 function clearActiveFilters() {
     crawlState.filters.active = null;
+    document.querySelectorAll('.filter-item').forEach(item => item.classList.remove('active'));
 
-    // Reset all virtual scrollers to show full data
+    if (_windowedTotals !== null) {
+        // Windowed mode: drop the category filter, keep any URL search active
+        _windowedFilter = '';
+        applyWindowedUrlQuery();
+        return;
+    }
+
+    // Owned mode: reset all virtual scrollers to show full data
     if (virtualScrollers.overview) {
         virtualScrollers.overview.setData(crawlState.urls);
     }
@@ -1252,6 +1320,29 @@ function clearActiveFilters() {
 
     // Reset Status Codes table to show all data
     updateStatusCodesTable();
+}
+
+function searchUrls(text) {
+    clearTimeout(_urlSearchTimer);
+    _urlSearchTimer = setTimeout(async function() {
+        const query = text.trim();
+
+        if (_windowedTotals !== null) {
+            // Windowed mode: fetch from server with q= (and any active filter)
+            _windowedSearchQuery = query;
+            applyWindowedUrlQuery();
+        } else {
+            // Owned mode: filter crawlState.urls in memory
+            let filtered = crawlState.urls;
+            if (query !== '') {
+                const lower = query.toLowerCase();
+                filtered = filtered.filter(u => u.url && u.url.toLowerCase().includes(lower));
+            }
+            if (virtualScrollers.overview) virtualScrollers.overview.setData(filtered);
+            if (virtualScrollers.internal) virtualScrollers.internal.setData(filtered.filter(u => u.is_internal));
+            if (virtualScrollers.external) virtualScrollers.external.setData(filtered.filter(u => !u.is_internal));
+        }
+    }, 250);
 }
 
 function filterVirtualScrollerData(scrollerName, filterType) {
@@ -1772,9 +1863,18 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-function showUrlDetails(url) {
-    // Find the URL data
-    const urlData = crawlState.urls.find(u => u.url === url);
+async function showUrlDetails(url) {
+    // Find the URL data — in windowed mode crawlState.urls is empty, so fetch from server
+    let urlData = crawlState.urls.find(u => u.url === url);
+    if (!urlData && _windowedTotals !== null) {
+        try {
+            const resp = await fetch('/api/crawl_data?kind=urls&q=' + encodeURIComponent(url) + '&limit=50');
+            const result = await resp.json();
+            urlData = (result.rows || []).find(u => u.url === url);
+        } catch (e) {
+            console.error('Error fetching URL details:', e);
+        }
+    }
     if (!urlData) {
         showNotification('URL data not found', 'error');
         return;
@@ -2045,21 +2145,49 @@ async function saveCrawl() {
         let issues = crawlState.issues;
         let stats = crawlState.stats;
 
-        // Try to get fresh data from backend if available
-        try {
-            const status = await fetch('/api/crawl_status');
-            const crawlData = await status.json();
-            if (crawlData.urls && crawlData.urls.length > 0) {
-                urls = crawlData.urls;
-                links = crawlData.links || links;
-                issues = crawlData.issues || issues;
-                // Update stats to include latest PageSpeed results if available
-                if (crawlData.stats) {
-                    stats = crawlData.stats;
+        if (_windowedTotals !== null) {
+            // Windowed mode: page through /api/crawl_data to assemble the full dataset
+            showNotification('Preparing crawl data…', 'info');
+            const pageLimit = 2000;
+            const kinds = [
+                { key: 'urls',   total: _windowedTotals.urls   || 0 },
+                { key: 'links',  total: _windowedTotals.links  || 0 },
+                { key: 'issues', total: _windowedTotals.issues || 0 }
+            ];
+            const assembled = {};
+            for (const { key, total } of kinds) {
+                const rows = [];
+                let offset = 0;
+                while (rows.length < total) {
+                    const resp = await fetch(`/api/crawl_data?kind=${key}&offset=${offset}&limit=${pageLimit}`);
+                    const data = await resp.json();
+                    const page = data.rows || [];
+                    rows.push(...page);
+                    if (page.length < pageLimit) break;
+                    offset += pageLimit;
                 }
+                assembled[key] = rows;
             }
-        } catch (e) {
-            console.log('Using local state for save:', e);
+            urls = assembled.urls;
+            links = assembled.links;
+            issues = assembled.issues;
+        } else {
+            // Try to get fresh data from backend if available
+            try {
+                const status = await fetch('/api/crawl_status');
+                const crawlData = await status.json();
+                if (crawlData.urls && crawlData.urls.length > 0) {
+                    urls = crawlData.urls;
+                    links = crawlData.links || links;
+                    issues = crawlData.issues || issues;
+                    // Update stats to include latest PageSpeed results if available
+                    if (crawlData.stats) {
+                        stats = crawlData.stats;
+                    }
+                }
+            } catch (e) {
+                console.log('Using local state for save:', e);
+            }
         }
 
         // Add metadata
