@@ -139,7 +139,15 @@ async function loadCrawlFromDashboard(crawlId) {
         updateCrawlButtons();
         updateStatus(`Loaded: ${statusData.urls?.length || 0} URLs`);
 
-        showNotification('Crawl loaded successfully', 'success');
+        if (data.links_capped) {
+            showNotification(
+                `Crawl loaded. Showing ${data.links_count.toLocaleString()} of ` +
+                `${data.links_total.toLocaleString()} links — use export for the full link data.`,
+                'warning'
+            );
+        } else {
+            showNotification('Crawl loaded successfully', 'success');
+        }
 
     } catch (error) {
         console.error('Error loading crawl:', error);

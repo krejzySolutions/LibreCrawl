@@ -45,6 +45,10 @@ DISABLE_GUEST = args.disable_guest or os.getenv('DISABLE_GUEST', '').lower() in 
 DEMO_MODE = args.demo or os.getenv('DEMO_MODE', '').lower() in ('true', '1', 'yes')
 SKIP_AUTH = args.dangerously_skip_auth or os.getenv('DANGEROUSLY_SKIP_AUTH', '').lower() in ('true', '1', 'yes')
 
+# Max number of link rows loaded into memory when viewing a historical crawl.
+# Large crawls can have millions of links; loading them all OOMs the instance.
+HISTORICAL_LINK_LOAD_CAP = 100000
+
 app = Flask(__name__, template_folder='web/templates', static_folder='web/static')
 app.secret_key = 'librecrawl-secret-key-change-in-production'  # TODO: Use environment variable in production
 
@@ -1071,7 +1075,8 @@ def get_crawl(crawl_id):
     """Get complete crawl data by ID"""
     try:
         user_id = session.get('user_id')
-        from src.crawl_db import get_crawl_by_id, load_crawled_urls, load_crawl_links, load_crawl_issues
+        from src.crawl_db import (get_crawl_by_id, load_crawled_urls, load_crawl_links,
+                                  load_crawl_issues, count_crawl_links)
 
         # Get crawl metadata
         crawl = get_crawl_by_id(crawl_id)
@@ -1082,17 +1087,20 @@ def get_crawl(crawl_id):
         if user_id and crawl.get('user_id') != user_id:
             return jsonify({'success': False, 'error': 'Unauthorized'}), 403
 
-        # Load all data
+        # Load all data — links are capped to avoid OOM on huge crawls
         urls = load_crawled_urls(crawl_id)
-        links = load_crawl_links(crawl_id)
+        links = load_crawl_links(crawl_id, limit=HISTORICAL_LINK_LOAD_CAP)
         issues = load_crawl_issues(crawl_id)
+        links_total = count_crawl_links(crawl_id)
 
         return jsonify({
             'success': True,
             'crawl': crawl,
             'urls': urls,
             'links': links,
-            'issues': issues
+            'issues': issues,
+            'links_total': links_total,
+            'links_capped': links_total > len(links)
         })
     except Exception as e:
         import traceback
@@ -1105,7 +1113,8 @@ def load_crawl_into_session(crawl_id):
     """Load a historical crawl into the current session"""
     try:
         user_id = session.get('user_id')
-        from src.crawl_db import get_crawl_by_id, load_crawled_urls, load_crawl_links, load_crawl_issues
+        from src.crawl_db import (get_crawl_by_id, load_crawled_urls, load_crawl_links,
+                                  load_crawl_issues, count_crawl_links)
 
         # Get crawl metadata
         crawl = get_crawl_by_id(crawl_id)
@@ -1123,10 +1132,11 @@ def load_crawl_into_session(crawl_id):
         if crawler.is_running:
             crawler.stop_crawl()
 
-        # Load all data from database
+        # Load data from database — links are capped to avoid OOM on huge crawls
         urls = load_crawled_urls(crawl_id)
-        links = load_crawl_links(crawl_id)
+        links = load_crawl_links(crawl_id, limit=HISTORICAL_LINK_LOAD_CAP)
         issues = load_crawl_issues(crawl_id)
+        links_total = count_crawl_links(crawl_id)
 
         # Inject into current crawler instance
         with crawler.results_lock:
@@ -1162,11 +1172,19 @@ def load_crawl_into_session(crawl_id):
         # Set Flask session flag for force full refresh
         session['force_full_refresh'] = True
 
+        links_capped = links_total > len(links)
+        message = f'Loaded {len(urls)} URLs, {len(links)} links, {len(issues)} issues'
+        if links_capped:
+            message += (f' (showing {len(links)} of {links_total} links – '
+                        f'use export for the full link data)')
+
         return jsonify({
             'success': True,
-            'message': f'Loaded {len(urls)} URLs, {len(links)} links, {len(issues)} issues',
+            'message': message,
             'urls_count': len(urls),
             'links_count': len(links),
+            'links_total': links_total,
+            'links_capped': links_capped,
             'issues_count': len(issues),
             'should_refresh_ui': True
         })
