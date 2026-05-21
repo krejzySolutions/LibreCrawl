@@ -577,6 +577,89 @@ def count_crawl_links(crawl_id):
         print(f"Error counting links: {e}")
         return 0
 
+def count_crawled_urls(crawl_id):
+    """Return the total number of crawled URLs stored for a crawl"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM crawled_urls WHERE crawl_id = ?', (crawl_id,))
+            row = cursor.fetchone()
+            return row[0] if row else 0
+    except Exception as e:
+        print(f"Error counting crawled URLs: {e}")
+        return 0
+
+def count_crawl_issues(crawl_id):
+    """Return the total number of issues stored for a crawl"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM crawl_issues WHERE crawl_id = ?', (crawl_id,))
+            row = cursor.fetchone()
+            return row[0] if row else 0
+    except Exception as e:
+        print(f"Error counting issues: {e}")
+        return 0
+
+def get_crawl_url_stats(crawl_id):
+    """Return aggregate filter-sidebar counts for a crawl, computed in SQL.
+
+    Used when viewing a historical crawl in windowed mode — the rows are not
+    held in browser memory, so the counts cannot be derived client-side.
+    """
+    stats = {
+        'total': 0, 'internal': 0, 'external': 0,
+        '2xx': 0, '3xx': 0, '4xx': 0, '5xx': 0, 'no_response': 0,
+        'html': 0, 'css': 0, 'js': 0, 'images': 0,
+    }
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute('SELECT COUNT(*) FROM crawled_urls WHERE crawl_id = ?', (crawl_id,))
+            stats['total'] = cursor.fetchone()[0]
+
+            cursor.execute('''SELECT is_internal, COUNT(*) FROM crawled_urls
+                              WHERE crawl_id = ? GROUP BY is_internal''', (crawl_id,))
+            for is_internal, count in cursor.fetchall():
+                if is_internal:
+                    stats['internal'] += count
+                else:
+                    stats['external'] += count
+
+            cursor.execute('''SELECT status_code, COUNT(*) FROM crawled_urls
+                              WHERE crawl_id = ? GROUP BY status_code''', (crawl_id,))
+            for status_code, count in cursor.fetchall():
+                sc = status_code or 0
+                if 200 <= sc < 300:
+                    stats['2xx'] += count
+                elif 300 <= sc < 400:
+                    stats['3xx'] += count
+                elif 400 <= sc < 500:
+                    stats['4xx'] += count
+                elif sc >= 500:
+                    stats['5xx'] += count
+                else:
+                    stats['no_response'] += count
+
+            cursor.execute('''SELECT content_type, COUNT(*) FROM crawled_urls
+                              WHERE crawl_id = ? GROUP BY content_type''', (crawl_id,))
+            for content_type, count in cursor.fetchall():
+                ct = (content_type or '').lower()
+                if 'html' in ct:
+                    stats['html'] += count
+                elif 'css' in ct:
+                    stats['css'] += count
+                elif 'javascript' in ct:
+                    stats['js'] += count
+                elif 'image' in ct:
+                    stats['images'] += count
+
+            return stats
+    except Exception as e:
+        print(f"Error computing crawl URL stats: {e}")
+        return stats
+
 def load_crawl_issues(crawl_id, limit=None, offset=0):
     """Load all issues for a crawl"""
     try:

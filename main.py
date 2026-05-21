@@ -9,6 +9,7 @@ import argparse
 import secrets
 import string
 import os
+import sqlite3
 from io import StringIO
 from datetime import datetime, timedelta
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
@@ -45,9 +46,6 @@ DISABLE_GUEST = args.disable_guest or os.getenv('DISABLE_GUEST', '').lower() in 
 DEMO_MODE = args.demo or os.getenv('DEMO_MODE', '').lower() in ('true', '1', 'yes')
 SKIP_AUTH = args.dangerously_skip_auth or os.getenv('DANGEROUSLY_SKIP_AUTH', '').lower() in ('true', '1', 'yes')
 
-# Max number of link rows loaded into memory when viewing a historical crawl.
-# Large crawls can have millions of links; loading them all OOMs the instance.
-HISTORICAL_LINK_LOAD_CAP = 100000
 
 app = Flask(__name__, template_folder='web/templates', static_folder='web/static')
 app.secret_key = 'librecrawl-secret-key-change-in-production'  # TODO: Use environment variable in production
@@ -55,7 +53,107 @@ app.secret_key = 'librecrawl-secret-key-change-in-production'  # TODO: Use envir
 # Enable compression for all responses
 Compress(app)
 
+def ensure_db_integrity():
+    """
+    Check the SQLite database for corruption before startup.
+    If corrupt, attempt VACUUM INTO recovery. If recovery fails, quarantine the file
+    so init_db() can recreate empty tables.
+    This must be called before any other DB connection is opened.
+    """
+    try:
+        from src.crawl_db import DB_FILE
+    except Exception:
+        DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'users.db')
+
+    if not os.path.exists(DB_FILE):
+        print("[DB] No existing database, will initialize fresh.")
+        return
+
+    db_dir = os.path.dirname(DB_FILE)
+    recovered_path = os.path.join(db_dir, 'users.recovered.db')
+
+    def _quarantine(label):
+        """Rename users.db (and WAL/SHM sidecars) to timestamped .corrupt files."""
+        ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+        corrupt_name = os.path.join(db_dir, f'users.db.corrupt.{ts}')
+        os.rename(DB_FILE, corrupt_name)
+        for sidecar in (DB_FILE + '-wal', DB_FILE + '-shm'):
+            if os.path.exists(sidecar):
+                os.rename(sidecar, sidecar.replace('users.db', f'users.db.corrupt.{ts}'))
+        return corrupt_name
+
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=10)
+        try:
+            row = conn.execute('PRAGMA integrity_check').fetchone()
+            result = row[0] if row else 'error'
+        finally:
+            conn.close()
+
+        if result == 'ok':
+            # Flush any orphaned WAL pages then return cleanly
+            conn2 = sqlite3.connect(DB_FILE, timeout=10)
+            try:
+                conn2.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            finally:
+                conn2.close()
+            print("[DB] Database integrity OK.")
+            return
+
+        # integrity_check returned something other than 'ok'
+        corrupt = True
+    except sqlite3.DatabaseError:
+        corrupt = True
+
+    if corrupt:
+        print("=" * 60)
+        print("[DB] WARNING: Database corruption detected in", DB_FILE)
+        print("[DB] Attempting recovery via VACUUM INTO ...")
+        print("=" * 60)
+
+        # Remove any stale recovery file
+        if os.path.exists(recovered_path):
+            os.remove(recovered_path)
+
+        recovery_ok = False
+        try:
+            conn = sqlite3.connect(DB_FILE, timeout=10)
+            try:
+                conn.execute(f"VACUUM INTO '{recovered_path}'")
+            finally:
+                conn.close()
+
+            # Verify the recovered file
+            conn2 = sqlite3.connect(recovered_path, timeout=10)
+            try:
+                row = conn2.execute('PRAGMA integrity_check').fetchone()
+                check = row[0] if row else 'error'
+            finally:
+                conn2.close()
+
+            recovery_ok = (check == 'ok')
+        except Exception as e:
+            print(f"[DB] Recovery attempt failed with error: {e}")
+            recovery_ok = False
+
+        if recovery_ok:
+            corrupt_name = _quarantine("post-recovery quarantine")
+            os.rename(recovered_path, DB_FILE)
+            print(f"[DB] Database recovered successfully; original quarantined as {os.path.basename(corrupt_name)}")
+        else:
+            if os.path.exists(recovered_path):
+                os.remove(recovered_path)
+            corrupt_name = _quarantine("unrecoverable quarantine")
+            print("=" * 60)
+            print("[DB] CRITICAL: Database could not be recovered.")
+            print("[DB] A fresh empty database will be created.")
+            print("[DB] AUTH ACCOUNTS WERE LOST — users must re-register.")
+            print(f"[DB] Corrupt file quarantined as {os.path.basename(corrupt_name)}")
+            print("=" * 60)
+        return
+
 # Initialize database on startup
+ensure_db_integrity()
 init_db()
 
 def generate_random_password(length=16):
@@ -755,6 +853,9 @@ def start_crawl():
         crawler.config['demo_mode'] = True
         crawler.config['demo_memory_limit_bytes'] = int(1.5 * 1024 * 1024 * 1024)  # 1.5GB
 
+    # Exit historical view mode before starting a new crawl
+    session.pop('viewing_crawl_id', None)
+
     # Pass user_id and session_id for database persistence
     success, message = crawler.start_crawl(url, user_id=user_id, session_id=session_id)
 
@@ -779,6 +880,29 @@ def crawl_status():
     crawler = get_or_create_crawler()
     settings_manager = get_session_settings()
 
+    # Historical view: return a lightweight stub — rows come from /api/crawl_data.
+    # The counts + url_stats let the UI restore windowed mode after a page reload.
+    viewing_crawl_id = session.get('viewing_crawl_id')
+    if viewing_crawl_id:
+        from src.crawl_db import (count_crawled_urls, count_crawl_links,
+                                  count_crawl_issues, get_crawl_url_stats)
+        return jsonify({
+            'status': 'completed',
+            'urls': [],
+            'links': [],
+            'issues': [],
+            'viewing_crawl_id': viewing_crawl_id,
+            'urls_count': count_crawled_urls(viewing_crawl_id),
+            'links_count': count_crawl_links(viewing_crawl_id),
+            'issues_count': count_crawl_issues(viewing_crawl_id),
+            'url_stats': get_crawl_url_stats(viewing_crawl_id),
+            'stats': {
+                'crawled': crawler.stats.get('crawled', 0),
+                'discovered': crawler.stats.get('discovered', 0),
+                'baseUrl': crawler.base_url or '',
+            }
+        })
+
     # Check for incremental update parameters
     url_since = request.args.get('url_since', type=int)
     link_since = request.args.get('link_since', type=int)
@@ -791,17 +915,13 @@ def crawl_status():
     if crawler.base_url and 'stats' in status_data:
         status_data['stats']['baseUrl'] = crawler.base_url
 
-    # Check if we need to force a full refresh (after loading from DB)
-    force_full = session.pop('force_full_refresh', False)
-
-    # If incremental parameters provided AND not forcing full refresh, slice the arrays
-    if not force_full:
-        if url_since is not None:
-            status_data['urls'] = status_data.get('urls', [])[url_since:]
-        if link_since is not None:
-            status_data['links'] = status_data.get('links', [])[link_since:]
-        if issue_since is not None:
-            status_data['issues'] = status_data.get('issues', [])[issue_since:]
+    # If incremental parameters provided, slice the arrays
+    if url_since is not None:
+        status_data['urls'] = status_data.get('urls', [])[url_since:]
+    if link_since is not None:
+        status_data['links'] = status_data.get('links', [])[link_since:]
+    if issue_since is not None:
+        status_data['issues'] = status_data.get('issues', [])[issue_since:]
 
     # Apply current issue exclusion patterns to displayed issues
     issues = status_data.get('issues', [])
@@ -814,17 +934,122 @@ def crawl_status():
 
     return jsonify(status_data)
 
+@app.route('/api/crawl_data')
+@login_required
+def crawl_data():
+    """Return a page of crawl rows (urls/links/issues) for the current session.
+
+    Query params:
+      kind    - 'urls' | 'links' | 'issues'  (default: 'urls')
+      offset  - int >= 0                      (default: 0)
+      limit   - int 1..2000                   (default: 1000)
+      q       - substring filter on 'url'     (optional)
+    """
+    kind = request.args.get('kind', 'urls')
+    if kind not in ('urls', 'links', 'issues'):
+        return jsonify({'success': False, 'error': 'kind must be urls, links, or issues'}), 400
+
+    try:
+        offset = max(0, int(request.args.get('offset', 0)))
+    except (ValueError, TypeError):
+        offset = 0
+
+    try:
+        limit = max(1, min(2000, int(request.args.get('limit', 1000))))
+    except (ValueError, TypeError):
+        limit = 1000
+
+    q = request.args.get('q', '').strip()
+
+    viewing_crawl_id = session.get('viewing_crawl_id')
+
+    if viewing_crawl_id:
+        from src.crawl_db import (load_crawled_urls, load_crawl_links, load_crawl_issues,
+                                  count_crawled_urls, count_crawl_links, count_crawl_issues,
+                                  get_db)
+        if kind == 'urls':
+            if q:
+                # Server-side substring filter on url column
+                try:
+                    with get_db() as conn:
+                        cursor = conn.cursor()
+                        like = f'%{q}%'
+                        cursor.execute(
+                            'SELECT COUNT(*) FROM crawled_urls WHERE crawl_id = ? AND url LIKE ?',
+                            (viewing_crawl_id, like)
+                        )
+                        total = cursor.fetchone()[0]
+                        cursor.execute(
+                            'SELECT * FROM crawled_urls WHERE crawl_id = ? AND url LIKE ?'
+                            ' ORDER BY crawled_at LIMIT ? OFFSET ?',
+                            (viewing_crawl_id, like, limit, offset)
+                        )
+                        import json as _json
+                        rows = []
+                        for row in cursor.fetchall():
+                            url_data = dict(row)
+                            for field in ['h2', 'h3', 'meta_tags', 'og_tags', 'twitter_tags',
+                                         'json_ld', 'analytics', 'images', 'hreflang',
+                                         'schema_org', 'redirects', 'linked_from']:
+                                if url_data.get(field):
+                                    try:
+                                        url_data[field] = _json.loads(url_data[field])
+                                    except Exception:
+                                        url_data[field] = []
+                            rows.append(url_data)
+                except Exception as e:
+                    return jsonify({'success': False, 'error': str(e)}), 500
+            else:
+                rows = load_crawled_urls(viewing_crawl_id, limit=limit, offset=offset)
+                total = count_crawled_urls(viewing_crawl_id)
+        elif kind == 'links':
+            rows = load_crawl_links(viewing_crawl_id, limit=limit, offset=offset)
+            total = count_crawl_links(viewing_crawl_id)
+        else:
+            rows = load_crawl_issues(viewing_crawl_id, limit=limit, offset=offset)
+            total = count_crawl_issues(viewing_crawl_id)
+    else:
+        # Live crawler path
+        crawler = get_or_create_crawler()
+        status_data = crawler.get_status()
+        if kind == 'urls':
+            all_rows = status_data.get('urls', [])
+        elif kind == 'links':
+            all_rows = status_data.get('links', [])
+        else:
+            all_rows = status_data.get('issues', [])
+
+        if q:
+            all_rows = [r for r in all_rows if q in r.get('url', '')]
+
+        total = len(all_rows)
+        rows = all_rows[offset:offset + limit]
+
+    return jsonify({
+        'success': True,
+        'kind': kind,
+        'rows': rows,
+        'total': total,
+        'offset': offset,
+        'limit': limit
+    })
+
 @app.route('/api/visualization_data')
 @login_required
 def visualization_data():
     """Get graph data for site structure visualization"""
     try:
         crawler = get_or_create_crawler()
-        status_data = crawler.get_status()
 
-        # Get URLs from the status data
-        crawled_pages = status_data.get('urls', [])
-        all_links = status_data.get('links', [])
+        viewing_crawl_id = session.get('viewing_crawl_id')
+        if viewing_crawl_id:
+            from src.crawl_db import load_crawled_urls
+            crawled_pages = load_crawled_urls(viewing_crawl_id, limit=500)
+            all_links = []
+        else:
+            status_data = crawler.get_status()
+            crawled_pages = status_data.get('urls', [])
+            all_links = status_data.get('links', [])
 
         # Build nodes and edges for the graph
         nodes = []
@@ -1075,32 +1300,29 @@ def get_crawl(crawl_id):
     """Get complete crawl data by ID"""
     try:
         user_id = session.get('user_id')
-        from src.crawl_db import (get_crawl_by_id, load_crawled_urls, load_crawl_links,
-                                  load_crawl_issues, count_crawl_links)
+        from src.crawl_db import (get_crawl_by_id, count_crawled_urls,
+                                  count_crawl_links, count_crawl_issues)
 
         # Get crawl metadata
         crawl = get_crawl_by_id(crawl_id)
         if not crawl:
             return jsonify({'success': False, 'error': 'Crawl not found'}), 404
 
-        # Check ownership (guests have user_id = None)
-        if user_id and crawl.get('user_id') != user_id:
+        # Check ownership — guest crawls (user_id=None) are accessible to any authenticated user
+        if user_id and crawl.get('user_id') is not None and crawl.get('user_id') != user_id:
             return jsonify({'success': False, 'error': 'Unauthorized'}), 403
 
-        # Load all data — links are capped to avoid OOM on huge crawls
-        urls = load_crawled_urls(crawl_id)
-        links = load_crawl_links(crawl_id, limit=HISTORICAL_LINK_LOAD_CAP)
-        issues = load_crawl_issues(crawl_id)
-        links_total = count_crawl_links(crawl_id)
+        # Return only metadata + counts — rows are fetched via /api/crawl_data
+        urls_count = count_crawled_urls(crawl_id)
+        links_count = count_crawl_links(crawl_id)
+        issues_count = count_crawl_issues(crawl_id)
 
         return jsonify({
             'success': True,
             'crawl': crawl,
-            'urls': urls,
-            'links': links,
-            'issues': issues,
-            'links_total': links_total,
-            'links_capped': links_total > len(links)
+            'urls_count': urls_count,
+            'links_count': links_count,
+            'issues_count': issues_count
         })
     except Exception as e:
         import traceback
@@ -1113,16 +1335,17 @@ def load_crawl_into_session(crawl_id):
     """Load a historical crawl into the current session"""
     try:
         user_id = session.get('user_id')
-        from src.crawl_db import (get_crawl_by_id, load_crawled_urls, load_crawl_links,
-                                  load_crawl_issues, count_crawl_links)
+        from src.crawl_db import (get_crawl_by_id, count_crawled_urls,
+                                  count_crawl_links, count_crawl_issues,
+                                  get_crawl_url_stats)
 
         # Get crawl metadata
         crawl = get_crawl_by_id(crawl_id)
         if not crawl:
             return jsonify({'success': False, 'error': 'Crawl not found'}), 404
 
-        # Check ownership
-        if user_id and crawl.get('user_id') != user_id:
+        # Check ownership — guest crawls (user_id=None) are accessible to any authenticated user
+        if user_id and crawl.get('user_id') is not None and crawl.get('user_id') != user_id:
             return jsonify({'success': False, 'error': 'Unauthorized'}), 403
 
         # Get current crawler instance
@@ -1132,60 +1355,37 @@ def load_crawl_into_session(crawl_id):
         if crawler.is_running:
             crawler.stop_crawl()
 
-        # Load data from database — links are capped to avoid OOM on huge crawls
-        urls = load_crawled_urls(crawl_id)
-        links = load_crawl_links(crawl_id, limit=HISTORICAL_LINK_LOAD_CAP)
-        issues = load_crawl_issues(crawl_id)
-        links_total = count_crawl_links(crawl_id)
+        # Compute counts — rows are fetched on demand via /api/crawl_data
+        urls_count = count_crawled_urls(crawl_id)
+        links_count = count_crawl_links(crawl_id)
+        issues_count = count_crawl_issues(crawl_id)
 
-        # Inject into current crawler instance
+        # Store which historical crawl is being viewed
+        session['viewing_crawl_id'] = crawl_id
+
+        # Set crawler header info without loading any rows into memory
         with crawler.results_lock:
-            crawler.crawl_results = urls
-            crawler.stats['crawled'] = len(urls)
-            crawler.stats['discovered'] = len(urls)
             crawler.base_url = crawl['base_url']
             crawler.base_domain = crawl['base_domain']
+            crawler.stats['crawled'] = urls_count
+            crawler.stats['discovered'] = urls_count
 
-        # Load links into link manager
-        if crawler.link_manager:
-            crawler.link_manager.all_links = links
-            # Rebuild links_set
-            crawler.link_manager.links_set.clear()
-            for link in links:
-                link_key = f"{link['source_url']}|{link['target_url']}"
-                crawler.link_manager.links_set.add(link_key)
+        message = f'Viewing crawl: {urls_count} URLs, {links_count} links, {issues_count} issues'
 
-        # Load issues into issue detector
-        if crawler.issue_detector:
-            crawler.issue_detector.detected_issues = issues
-
-        # Rebuild per-user memory tracker for loaded data
-        crawler.user_memory.reset()
-        crawler._demo_limit_reached = False
-        for url_data in urls:
-            crawler.user_memory.track_url(url_data)
-        if links:
-            crawler.user_memory.track_links(links)
-        if issues:
-            crawler.user_memory.track_issues(issues)
-
-        # Set Flask session flag for force full refresh
-        session['force_full_refresh'] = True
-
-        links_capped = links_total > len(links)
-        message = f'Loaded {len(urls)} URLs, {len(links)} links, {len(issues)} issues'
-        if links_capped:
-            message += (f' (showing {len(links)} of {links_total} links – '
-                        f'use export for the full link data)')
+        # Aggregate filter-sidebar counts (computed in SQL — rows are not in memory)
+        url_stats = get_crawl_url_stats(crawl_id)
 
         return jsonify({
             'success': True,
             'message': message,
-            'urls_count': len(urls),
-            'links_count': len(links),
-            'links_total': links_total,
-            'links_capped': links_capped,
-            'issues_count': len(issues),
+            'urls_count': urls_count,
+            'links_count': links_count,
+            'issues_count': issues_count,
+            'url_stats': url_stats,
+            'crawl': {
+                'base_url': crawl.get('base_url'),
+                'max_depth_reached': crawl.get('max_depth_reached', 0),
+            },
             'should_refresh_ui': True
         })
 
@@ -1209,6 +1409,9 @@ def resume_crawl_endpoint(crawl_id):
         if DEMO_MODE:
             crawler.config['demo_mode'] = True
             crawler.config['demo_memory_limit_bytes'] = int(1.5 * 1024 * 1024 * 1024)
+
+        # Exit historical view mode before resuming
+        session.pop('viewing_crawl_id', None)
 
         # Resume from database
         success, message = crawler.resume_from_database(crawl_id, user_id=user_id, session_id=session_id)
@@ -1305,11 +1508,37 @@ def export_data():
         export_fields = data.get('fields', ['url', 'status_code', 'title'])
         local_data = data.get('localData', {})
 
-        # Use local data if provided (from loaded crawl), otherwise get from crawler
+        # Use local data if provided, otherwise check for historical view or live crawler
         if local_data and local_data.get('urls'):
             urls = local_data.get('urls', [])
             links = local_data.get('links', [])
             issues = local_data.get('issues', [])
+        elif session.get('viewing_crawl_id'):
+            from src.crawl_db import load_crawled_urls, load_crawl_links, load_crawl_issues
+            vid = session['viewing_crawl_id']
+            chunk = 5000
+            urls, links, issues = [], [], []
+            offset = 0
+            while True:
+                batch = load_crawled_urls(vid, limit=chunk, offset=offset)
+                if not batch:
+                    break
+                urls.extend(batch)
+                offset += chunk
+            offset = 0
+            while True:
+                batch = load_crawl_links(vid, limit=chunk, offset=offset)
+                if not batch:
+                    break
+                links.extend(batch)
+                offset += chunk
+            offset = 0
+            while True:
+                batch = load_crawl_issues(vid, limit=chunk, offset=offset)
+                if not batch:
+                    break
+                issues.extend(batch)
+                offset += chunk
         else:
             # Get current crawl results
             crawler = get_or_create_crawler()

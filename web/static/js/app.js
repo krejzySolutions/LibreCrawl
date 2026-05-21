@@ -59,111 +59,43 @@ async function initializeApp() {
     // Load user info
     loadUserInfo();
 
-    // DEBUG: Check sessionStorage
-    console.log('DEBUG: Checking sessionStorage force_ui_refresh:', sessionStorage.getItem('force_ui_refresh'));
+    // Restore a historical crawl if one is being viewed in this session.
+    // viewing_crawl_id survives page reloads (it lives in the Flask session),
+    // so refreshing the browser must re-enter windowed mode rather than show
+    // an empty table.
+    try {
+        const response = await fetch('/api/crawl_status');
+        const data = await response.json();
 
-    // Check if we just loaded a crawl from dashboard
-    if (sessionStorage.getItem('force_ui_refresh') === 'true') {
-        console.log('DEBUG: Found force_ui_refresh flag, loading crawl data...');
-        sessionStorage.removeItem('force_ui_refresh');
-
-        try {
-            // Fetch the loaded data immediately with FULL refresh (no incremental)
-            const response = await fetch('/api/crawl_status');
-            const data = await response.json();
-
-            // DEBUG: Log the full response
-            console.log('DEBUG: Full /api/crawl_status response:', JSON.stringify(data, null, 2));
-
-            // Clear existing data first
-            clearAllTables();
-            resetStats();
-
-            // Force populate all data
+        if (data.viewing_crawl_id) {
             crawlState.urls = [];
-            crawlState.links = data.links || [];
-            crawlState.issues = data.issues || [];
-            crawlState.stats = data.stats || {};
+            crawlState.links = [];
+            crawlState.issues = [];
             crawlState.baseUrl = data.stats?.baseUrl || '';
-
-            // Set URL input
+            crawlState.stats = {
+                discovered: data.urls_count || 0,
+                crawled: data.urls_count || 0,
+                depth: data.stats?.depth || 0,
+                speed: 0
+            };
             if (crawlState.baseUrl) {
                 document.getElementById('urlInput').value = crawlState.baseUrl;
             }
 
-            // Add each URL to tables
-            if (data.urls && data.urls.length > 0) {
-                data.urls.forEach(url => addUrlToTable(url));
-            }
+            switchScrollersToWindowed({
+                urls: data.urls_count || 0,
+                links: data.links_count || 0,
+                issues: data.issues_count || 0,
+                url_stats: data.url_stats || null
+            });
 
-            // Load links if present
-            if (data.links && data.links.length > 0) {
-                crawlState.pendingLinks = data.links;
-                // If links tab is active, load them immediately
-                if (isLinksTabActive()) {
-                    updateLinksTable(data.links);
-                }
-            }
-
-            // Load issues if present
-            if (data.issues && data.issues.length > 0) {
-                crawlState.pendingIssues = data.issues;
-                // If issues tab is active, load them immediately
-                if (isIssuesTabActive()) {
-                    updateIssuesTable(data.issues);
-                } else {
-                    // Update badge count even if tab not active
-                    const issuesTabButton = Array.from(document.querySelectorAll('.tab-btn')).find(btn => btn.textContent.includes('Issues'));
-                    if (issuesTabButton && data.issues.length > 0) {
-                        const errorCount = data.issues.filter(i => i.type === 'error').length;
-                        const warningCount = data.issues.filter(i => i.type === 'warning').length;
-                        let badgeColor = '#3b82f6';
-                        if (errorCount > 0) badgeColor = '#ef4444';
-                        else if (warningCount > 0) badgeColor = '#f59e0b';
-                        issuesTabButton.innerHTML = `Issues <span style="background: ${badgeColor}; color: white; padding: 2px 6px; border-radius: 12px; font-size: 12px;">${data.issues.length}</span>`;
-                    }
-                }
-            }
-
-            // Update all displays
             updateStatsDisplay();
             updateFilterCounts();
-            updateStatusCodesTable();
             updateCrawlButtons();
-
-            // Check if the crawl is currently running (resumed from dashboard)
-            if (data.status === 'running') {
-                // Set crawl state to running
-                crawlState.isRunning = true;
-                crawlState.isPaused = false;
-                crawlState.startTime = new Date(); // Set start time to now for timer
-
-                // Show progress UI
-                showProgress();
-
-                // Update buttons for running state
-                updateCrawlButtons();
-
-                // Start polling for updates
-                updateStatus('Crawl resumed - updating...');
-                pollCrawlProgress();
-            } else {
-                // Crawl is not running, just loaded data
-                updateStatus(`Loaded crawl: ${data.stats.crawled} URLs, ${data.links?.length || 0} links, ${data.issues?.length || 0} issues`);
-            }
-
-            console.log('Loaded crawl from database:', {
-                urls: data.urls?.length || 0,
-                links: data.links?.length || 0,
-                issues: data.issues?.length || 0,
-                stats: data.stats,
-                status: data.status,
-                isRunning: crawlState.isRunning
-            });
-        } catch (error) {
-            console.error('Error loading crawl data:', error);
-            updateStatus('Error loading crawl data');
+            updateStatus(`Loaded crawl: ${(data.urls_count || 0).toLocaleString()} URLs`);
         }
+    } catch (error) {
+        console.error('Error restoring viewed crawl:', error);
     }
 
     // Set initial focus
@@ -222,6 +154,11 @@ function startCrawl() {
     crawlState.isPaused = false;
     crawlState.startTime = new Date();
     crawlState.baseUrl = url;
+
+    // Restore owned scrollers if we were previously viewing a historical crawl
+    if (_windowedTotals !== null) {
+        switchScrollersToOwned();
+    }
 
     // Initialize incremental poller for new crawl
     if (!incrementalPoller) {
@@ -698,6 +635,21 @@ function initializeTables() {
 
 function initializeVirtualScrollers() {
     try {
+        // Tear down any existing scrollers (e.g. windowed ones from a historical
+        // view) before recreating — otherwise stale spacers and observers from
+        // the old instances collide with the new ones.
+        Object.keys(virtualScrollers).forEach(key => {
+            const scroller = virtualScrollers[key];
+            if (scroller) {
+                try { scroller.destroy(); } catch (e) { /* ignore */ }
+                const tbody = scroller.tableBody;
+                if (tbody) {
+                    while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+                }
+            }
+            delete virtualScrollers[key];
+        });
+
         // Overview table
         const overviewContainer = document.querySelector('#overview-tab .table-container');
         if (overviewContainer && overviewContainer.querySelector('tbody')) {
@@ -767,6 +719,100 @@ function initializeVirtualScrollers() {
         console.error('Error initializing virtual scrollers:', error);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Windowed mode — used when viewing a historical crawl from the dashboard.
+// Rows are fetched page-by-page from /api/crawl_data instead of being held
+// in memory, so large crawls no longer freeze the browser with bulk DOM mutations.
+// ---------------------------------------------------------------------------
+
+// Tracks totals for windowed mode; null means live/owned mode is active.
+let _windowedTotals = null; // null = owned; {urls, links, issues} = windowed
+let _windowedUrlStats = null; // SQL-computed filter-sidebar breakdown for the viewed crawl
+
+/**
+ * Rebuild the virtual scrollers in windowed mode for a historical crawl.
+ *
+ * counts: { urls: N, links: N, issues: N }
+ *
+ * Load-flow trace:
+ *   1. dashboard.js loadCrawlFromDashboard() calls switchScrollersToWindowed({urls, links, issues})
+ *   2. Each scroller is recreated with mode:'windowed'
+ *   3. setFetchPage() closure GETs /api/crawl_data?kind=...&offset=N&limit=M
+ *   4. setTotalCount(N) — scroller sets scroll geometry and triggers render()
+ *   5. render() sees missing page 0, shows placeholders, schedules _scheduleFetch()
+ *   6. After 120 ms debounce _fetchVisiblePages() → _loadPage(0) → fetchPage(0, 1000)
+ *   7. fetch('/api/crawl_data?kind=urls&offset=0&limit=1000') resolves with {rows:[...]}
+ *   8. _onPageArrived(0) invalidates cached range → render() replaces placeholders with real rows
+ */
+function switchScrollersToWindowed(counts) {
+    _windowedTotals = counts;
+    _windowedUrlStats = counts.url_stats || null;
+
+    function makeFetchFn(kind) {
+        return function(offset, limit) {
+            return fetch(`/api/crawl_data?kind=${kind}&offset=${offset}&limit=${limit}`)
+                .then(r => r.json())
+                .then(data => data.rows || []);
+        };
+    }
+
+    const urlCount   = counts.urls   || 0;
+    const linkCount  = counts.links  || 0;
+    const issueCount = counts.issues || 0;
+
+    function recreateWindowed(key, containerSelector, renderFn, fetchFn, total, rowHeight) {
+        const container = document.querySelector(containerSelector);
+        if (!container || !container.querySelector('tbody')) return;
+
+        if (virtualScrollers[key]) {
+            try { virtualScrollers[key].destroy(); } catch (e) { /* ignore */ }
+        }
+
+        // Clear tbody before handing to the new scroller instance
+        const tbody = container.querySelector('tbody');
+        while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+
+        virtualScrollers[key] = new VirtualScroller(container, {
+            mode: 'windowed',
+            pageSize: 1000,
+            rowHeight: rowHeight || 80,
+            buffer: 25,
+            renderRow: renderFn,
+            fetchPage: fetchFn
+        });
+        virtualScrollers[key].setTotalCount(total);
+    }
+
+    // NOTE: overview, internal, and external all use kind='urls' (the server returns all crawled
+    // URLs; renderRow functions handle the is_internal distinction for display purposes).
+    // TODO: add kind='internal_urls' / 'external_urls' server-side to properly sub-filter tabs.
+    const urlFetch   = makeFetchFn('urls');
+    const linkFetch  = makeFetchFn('links');
+    const issueFetch = makeFetchFn('issues');
+
+    recreateWindowed('overview',      '#overview-tab .table-container',         renderOverviewRow,     urlFetch,   urlCount,   100);
+    recreateWindowed('internal',      '#internal-tab .table-container',         renderInternalRow,     urlFetch,   urlCount,   80);
+    recreateWindowed('external',      '#external-tab .table-container',         renderExternalRow,     urlFetch,   urlCount,   80);
+    recreateWindowed('internalLinks', '#links-tab .internal-links-container',   renderInternalLinkRow, linkFetch,  linkCount,  80);
+    recreateWindowed('externalLinks', '#links-tab .external-links-container',   renderExternalLinkRow, linkFetch,  linkCount,  80);
+    recreateWindowed('issues',        '#issues-tab .table-container',           renderIssueRow,        issueFetch, issueCount, 80);
+
+    console.log('Virtual scrollers switched to windowed mode', counts);
+}
+
+/**
+ * Restore all virtual scrollers to owned (live-crawl) mode.
+ * Called at the start of a new crawl so addUrlToTable / appendData work again.
+ */
+function switchScrollersToOwned() {
+    _windowedTotals = null;
+    _windowedUrlStats = null;
+    initializeVirtualScrollers();
+    console.log('Virtual scrollers switched to owned mode');
+}
+
+// ---------------------------------------------------------------------------
 
 function isLinksTabActive() {
     const linksTab = document.getElementById('links-tab');
@@ -1290,7 +1336,20 @@ function isContentType(contentType, type) {
 }
 
 function updateFilterCounts() {
-    // Count URLs by type and update filter counts
+    // In windowed mode crawlState.urls is empty (rows live on the server).
+    // Use the SQL-computed breakdown returned by /api/crawls/<id>/load.
+    if (_windowedTotals !== null) {
+        const s = _windowedUrlStats;
+        const keys = ['internal', 'external', '2xx', '3xx', '4xx', '5xx',
+                      'no_response', 'html', 'css', 'js', 'images'];
+        keys.forEach(key => {
+            const element = document.getElementById(key + '-count');
+            if (element) element.textContent = (s && s[key] != null) ? s[key] : 0;
+        });
+        return;
+    }
+
+    // Owned mode: count from local crawlState.urls
     const counts = {
         internal: 0,
         external: 0,
@@ -1562,7 +1621,53 @@ async function exportData() {
         const exportFormat = settings.exportFormat || 'csv';
         const exportFields = settings.exportFields || ['url', 'status_code', 'title', 'meta_description', 'h1'];
 
-        // Check if there's data to export - always fetch fresh data from backend
+        // In windowed mode we're viewing a historical crawl — all data is in the DB.
+        // Send no localData so the backend reads from viewing_crawl_id directly.
+        if (_windowedTotals !== null) {
+            showNotification('Preparing export...', 'info');
+            const exportResponse = await fetch('/api/export_data', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ format: exportFormat, fields: exportFields })
+            });
+            const exportData = await exportResponse.json();
+            if (!exportData.success) {
+                showNotification(exportData.error || 'Export failed', 'error');
+                return;
+            }
+            if (exportData.multiple_files && exportData.files) {
+                exportData.files.forEach((file, index) => {
+                    setTimeout(() => {
+                        const blob = new Blob([file.content], { type: file.mimetype });
+                        const url = window.URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.style.display = 'none';
+                        a.href = url;
+                        a.download = file.filename;
+                        document.body.appendChild(a);
+                        a.click();
+                        window.URL.revokeObjectURL(url);
+                        document.body.removeChild(a);
+                    }, index * 500);
+                });
+                showNotification(`Exporting ${exportData.files.length} files...`, 'success');
+            } else {
+                const blob = new Blob([exportData.content], { type: exportData.mimetype });
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.style.display = 'none';
+                a.href = url;
+                a.download = exportData.filename;
+                document.body.appendChild(a);
+                a.click();
+                window.URL.revokeObjectURL(url);
+                document.body.removeChild(a);
+                showNotification(`Export complete: ${exportData.filename}`, 'success');
+            }
+            return;
+        }
+
+        // Owned mode: check if there's data to export - always fetch fresh data from backend
         let hasData = false;
         let exportUrls = [];
         let exportLinks = [];

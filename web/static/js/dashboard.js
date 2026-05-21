@@ -97,57 +97,43 @@ async function loadCrawlFromDashboard(crawlId) {
         // Close dashboard
         closeDashboard();
 
-        // Fetch the loaded data
-        const statusResponse = await fetch('/api/crawl_status');
-        const statusData = await statusResponse.json();
-
-        // Clear UI
+        // Clear UI and reset state
         clearAllTables();
         resetStats();
-
-        // Populate data
         crawlState.urls = [];
-        crawlState.links = statusData.links || [];
-        crawlState.issues = statusData.issues || [];
-        crawlState.stats = statusData.stats || {};
-        crawlState.baseUrl = statusData.stats?.baseUrl || '';
+        crawlState.links = [];
+        crawlState.issues = [];
+        crawlState.baseUrl = data.crawl?.base_url || '';
+        crawlState.stats = {
+            discovered: data.urls_count || 0,
+            crawled: data.urls_count || 0,
+            depth: data.crawl?.max_depth_reached || 0,
+            speed: 0
+        };
 
         // Set URL input
         if (crawlState.baseUrl) {
             document.getElementById('urlInput').value = crawlState.baseUrl;
         }
 
-        // Add URLs to tables
-        if (statusData.urls && statusData.urls.length > 0) {
-            statusData.urls.forEach(url => addUrlToTable(url));
-        }
-
-        // Load links
-        if (statusData.links && statusData.links.length > 0) {
-            crawlState.pendingLinks = statusData.links;
-        }
-
-        // Load issues
-        if (statusData.issues && statusData.issues.length > 0) {
-            crawlState.pendingIssues = statusData.issues;
-        }
+        // Switch virtual scrollers to windowed (paginated) mode.
+        // The backend no longer loads all rows into memory, so we fetch pages
+        // on demand from /api/crawl_data instead of reading from crawlState.urls.
+        // url_stats carries the SQL-computed filter-sidebar breakdown.
+        switchScrollersToWindowed({
+            urls: data.urls_count || 0,
+            links: data.links_count || 0,
+            issues: data.issues_count || 0,
+            url_stats: data.url_stats || null
+        });
 
         // Update displays
         updateStatsDisplay();
         updateFilterCounts();
-        updateStatusCodesTable();
         updateCrawlButtons();
-        updateStatus(`Loaded: ${statusData.urls?.length || 0} URLs`);
+        updateStatus(`Loaded: ${(data.urls_count || 0).toLocaleString()} URLs`);
 
-        if (data.links_capped) {
-            showNotification(
-                `Crawl loaded. Showing ${data.links_count.toLocaleString()} of ` +
-                `${data.links_total.toLocaleString()} links — use export for the full link data.`,
-                'warning'
-            );
-        } else {
-            showNotification('Crawl loaded successfully', 'success');
-        }
+        showNotification('Crawl loaded successfully', 'success');
 
     } catch (error) {
         console.error('Error loading crawl:', error);
@@ -172,6 +158,12 @@ async function resumeCrawlFromDashboard(crawlId) {
 
         // Close dashboard
         closeDashboard();
+
+        // A resumed crawl is live — restore owned-mode scrollers if we were
+        // previously viewing a historical crawl in windowed mode.
+        if (typeof _windowedTotals !== 'undefined' && _windowedTotals !== null) {
+            switchScrollersToOwned();
+        }
 
         // Fetch the loaded data
         const statusResponse = await fetch('/api/crawl_status');

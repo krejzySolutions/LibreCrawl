@@ -6,3 +6,7 @@ data/*.db
 .idea
 .env
 docker-compose.override.yml
+.venv/
+venv/
+.playwright-mcp/
+__pycache__/
