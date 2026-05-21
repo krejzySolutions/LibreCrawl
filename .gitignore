@@ -3,3 +3,10 @@
 .claude/settings.local.json
 users.db
 data/*.db
+.idea
+.env
+docker-compose.override.yml
+.venv/
+venv/
+.playwright-mcp/
+__pycache__/
