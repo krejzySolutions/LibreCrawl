@@ -732,7 +732,48 @@ function initializeVirtualScrollers() {
 let _windowedTotals = null; // null = owned; {urls, links, issues} = windowed
 let _windowedUrlStats = null; // SQL-computed filter-sidebar breakdown for the viewed crawl
 let _windowedSearchQuery = ''; // current URL substring search query in windowed mode
+let _windowedFilter = ''; // current sidebar category filter in windowed mode
 let _urlSearchTimer = null; // debounce timer for searchUrls()
+
+/**
+ * Build a /api/crawl_data URL carrying the active windowed search + filter.
+ */
+function buildCrawlDataUrl(kind, offset, limit) {
+    let url = `/api/crawl_data?kind=${kind}&offset=${offset}&limit=${limit}`;
+    if (kind === 'urls') {
+        if (_windowedSearchQuery) url += `&q=${encodeURIComponent(_windowedSearchQuery)}`;
+        if (_windowedFilter) url += `&filter=${encodeURIComponent(_windowedFilter)}`;
+    }
+    return url;
+}
+
+/**
+ * Re-point the URL scrollers (overview/internal/external) at the server with
+ * the current windowed search query + category filter applied, and refresh
+ * their total row counts. Used by both searchUrls() and toggleFilter().
+ */
+async function applyWindowedUrlQuery() {
+    let total;
+    try {
+        const resp = await fetch(buildCrawlDataUrl('urls', 0, 1));
+        total = (await resp.json()).total || 0;
+    } catch (e) {
+        console.error('applyWindowedUrlQuery probe failed:', e);
+        return;
+    }
+    const fetchFn = function(offset, limit) {
+        return fetch(buildCrawlDataUrl('urls', offset, limit))
+            .then(r => r.json())
+            .then(d => d.rows || []);
+    };
+    ['overview', 'internal', 'external'].forEach(function(key) {
+        const scroller = virtualScrollers[key];
+        if (!scroller) return;
+        scroller.setFetchPage(fetchFn);
+        scroller.reset();
+        scroller.setTotalCount(total);
+    });
+}
 
 /**
  * Rebuild the virtual scrollers in windowed mode for a historical crawl.
@@ -753,14 +794,11 @@ function switchScrollersToWindowed(counts) {
     _windowedTotals = counts;
     _windowedUrlStats = counts.url_stats || null;
     _windowedSearchQuery = '';
+    _windowedFilter = '';
 
     function makeFetchFn(kind) {
         return function(offset, limit) {
-            let url = `/api/crawl_data?kind=${kind}&offset=${offset}&limit=${limit}`;
-            if (kind === 'urls' && _windowedSearchQuery) {
-                url += `&q=${encodeURIComponent(_windowedSearchQuery)}`;
-            }
-            return fetch(url)
+            return fetch(buildCrawlDataUrl(kind, offset, limit))
                 .then(r => r.json())
                 .then(data => data.rows || []);
         };
@@ -1218,14 +1256,27 @@ function filterIssues(filterType) {
 
 // Filter Management
 function toggleFilter(filterType) {
+    // Clicking the active filter again clears it
+    if (crawlState.filters.active === filterType) {
+        clearActiveFilters();
+        return;
+    }
+
     const filterItems = document.querySelectorAll('.filter-item');
     filterItems.forEach(item => item.classList.remove('active'));
-
-    event.currentTarget.classList.add('active');
+    if (typeof event !== 'undefined' && event && event.currentTarget) {
+        event.currentTarget.classList.add('active');
+    }
     crawlState.filters.active = filterType;
 
-    // Apply filter to tables
-    applyFilter(filterType);
+    if (_windowedTotals !== null) {
+        // Windowed mode (historical crawl): filter server-side
+        _windowedFilter = filterType;
+        applyWindowedUrlQuery();
+    } else {
+        // Owned mode (live crawl): filter the in-memory arrays
+        applyFilter(filterType);
+    }
 }
 
 function applyFilter(filterType) {
@@ -1245,8 +1296,16 @@ function applyFilter(filterType) {
 
 function clearActiveFilters() {
     crawlState.filters.active = null;
+    document.querySelectorAll('.filter-item').forEach(item => item.classList.remove('active'));
 
-    // Reset all virtual scrollers to show full data
+    if (_windowedTotals !== null) {
+        // Windowed mode: drop the category filter, keep any URL search active
+        _windowedFilter = '';
+        applyWindowedUrlQuery();
+        return;
+    }
+
+    // Owned mode: reset all virtual scrollers to show full data
     if (virtualScrollers.overview) {
         virtualScrollers.overview.setData(crawlState.urls);
     }
@@ -1269,33 +1328,9 @@ function searchUrls(text) {
         const query = text.trim();
 
         if (_windowedTotals !== null) {
-            // Windowed mode: fetch from server with q= filter
+            // Windowed mode: fetch from server with q= (and any active filter)
             _windowedSearchQuery = query;
-            let total;
-            if (query === '') {
-                total = _windowedTotals.urls || 0;
-            } else {
-                try {
-                    const resp = await fetch('/api/crawl_data?kind=urls&q=' + encodeURIComponent(query) + '&offset=0&limit=1');
-                    const data = await resp.json();
-                    total = data.total || 0;
-                } catch (e) {
-                    console.error('searchUrls probe failed:', e);
-                    return;
-                }
-            }
-            const fetchFn = function(offset, limit) {
-                let url = `/api/crawl_data?kind=urls&offset=${offset}&limit=${limit}`;
-                if (_windowedSearchQuery) url += `&q=${encodeURIComponent(_windowedSearchQuery)}`;
-                return fetch(url).then(r => r.json()).then(d => d.rows || []);
-            };
-            ['overview', 'internal', 'external'].forEach(function(key) {
-                const scroller = virtualScrollers[key];
-                if (!scroller) return;
-                scroller.setFetchPage(fetchFn);
-                scroller.reset();
-                scroller.setTotalCount(total);
-            });
+            applyWindowedUrlQuery();
         } else {
             // Owned mode: filter crawlState.urls in memory
             let filtered = crawlState.urls;

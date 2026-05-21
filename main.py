@@ -968,40 +968,57 @@ def crawl_data():
                                   count_crawled_urls, count_crawl_links, count_crawl_issues,
                                   get_db)
         if kind == 'urls':
+            # Build a WHERE clause from the optional `q` (url substring) and
+            # `filter` (sidebar category) params. filter_sql values are fixed
+            # constants — no user input is interpolated into the SQL.
+            filt = request.args.get('filter', '').strip()
+            filter_sql = {
+                'internal': 'is_internal = 1',
+                'external': 'is_internal = 0',
+                '2xx': 'status_code BETWEEN 200 AND 299',
+                '3xx': 'status_code BETWEEN 300 AND 399',
+                '4xx': 'status_code BETWEEN 400 AND 499',
+                '5xx': 'status_code >= 500',
+                'no_response': '(status_code IS NULL OR status_code = 0)',
+                'html': "content_type LIKE '%html%'",
+                'css': "content_type LIKE '%css%'",
+                'js': "content_type LIKE '%javascript%'",
+                'images': "content_type LIKE '%image%'",
+            }
+            conditions = ['crawl_id = ?']
+            cond_params = [viewing_crawl_id]
             if q:
-                # Server-side substring filter on url column
-                try:
-                    with get_db() as conn:
-                        cursor = conn.cursor()
-                        like = f'%{q}%'
-                        cursor.execute(
-                            'SELECT COUNT(*) FROM crawled_urls WHERE crawl_id = ? AND url LIKE ?',
-                            (viewing_crawl_id, like)
-                        )
-                        total = cursor.fetchone()[0]
-                        cursor.execute(
-                            'SELECT * FROM crawled_urls WHERE crawl_id = ? AND url LIKE ?'
-                            ' ORDER BY crawled_at LIMIT ? OFFSET ?',
-                            (viewing_crawl_id, like, limit, offset)
-                        )
-                        import json as _json
-                        rows = []
-                        for row in cursor.fetchall():
-                            url_data = dict(row)
-                            for field in ['h2', 'h3', 'meta_tags', 'og_tags', 'twitter_tags',
-                                         'json_ld', 'analytics', 'images', 'hreflang',
-                                         'schema_org', 'redirects', 'linked_from']:
-                                if url_data.get(field):
-                                    try:
-                                        url_data[field] = _json.loads(url_data[field])
-                                    except Exception:
-                                        url_data[field] = []
-                            rows.append(url_data)
-                except Exception as e:
-                    return jsonify({'success': False, 'error': str(e)}), 500
-            else:
-                rows = load_crawled_urls(viewing_crawl_id, limit=limit, offset=offset)
-                total = count_crawled_urls(viewing_crawl_id)
+                conditions.append('url LIKE ?')
+                cond_params.append(f'%{q}%')
+            if filt in filter_sql:
+                conditions.append(filter_sql[filt])
+            where = ' AND '.join(conditions)
+            try:
+                with get_db() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(f'SELECT COUNT(*) FROM crawled_urls WHERE {where}',
+                                   cond_params)
+                    total = cursor.fetchone()[0]
+                    cursor.execute(
+                        f'SELECT * FROM crawled_urls WHERE {where}'
+                        ' ORDER BY crawled_at LIMIT ? OFFSET ?',
+                        cond_params + [limit, offset]
+                    )
+                    import json as _json
+                    rows = []
+                    for row in cursor.fetchall():
+                        url_data = dict(row)
+                        for field in ['h2', 'h3', 'meta_tags', 'og_tags', 'twitter_tags',
+                                     'json_ld', 'analytics', 'images', 'hreflang',
+                                     'schema_org', 'redirects', 'linked_from']:
+                            if url_data.get(field):
+                                try:
+                                    url_data[field] = _json.loads(url_data[field])
+                                except Exception:
+                                    url_data[field] = []
+                        rows.append(url_data)
+            except Exception as e:
+                return jsonify({'success': False, 'error': str(e)}), 500
         elif kind == 'links':
             rows = load_crawl_links(viewing_crawl_id, limit=limit, offset=offset)
             total = count_crawl_links(viewing_crawl_id)
