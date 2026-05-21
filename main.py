@@ -1442,6 +1442,8 @@ def delete_crawl_endpoint(crawl_id):
             return jsonify({'success': False, 'error': 'Unauthorized'}), 403
 
         success = delete_crawl(crawl_id)
+        if success and session.get('viewing_crawl_id') == crawl_id:
+            session.pop('viewing_crawl_id', None)
         return jsonify({'success': success, 'message': 'Crawl deleted successfully' if success else 'Failed to delete crawl'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
